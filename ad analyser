@@ -1,0 +1,679 @@
+# ===============================
+# META ADS LIBRARY ANALYZER
+# HARDENED PRODUCTION VERSION
+# ===============================
+
+import streamlit as st
+import cv2
+import numpy as np
+from PIL import Image
+import pandas as pd
+import tempfile
+import zipfile
+import re
+from pathlib import Path
+# -------------------------------
+# AI / ML imports
+# -------------------------------
+import torch
+from transformers import CLIPProcessor, CLIPModel
+import easyocr
+import whisper
+import mediapipe as mp
+
+# -------------------------------
+# GLOBAL READERS (SAFE)
+# -------------------------------
+reader = easyocr.Reader(['en'], gpu=False)
+HOOK_AUDIO_SECONDS = 6
+
+GENERIC_FILENAME_TOKENS = {
+    "video", "videoplayback", "playback", "clip", "ad", "ads",
+    "meta", "library", "download", "new", "final", "copy", "edit",
+    "draft", "untitled", "sample", "test", "recording", "screen"
+}
+
+GENERIC_TEXT_TOKENS = {
+    "buy", "shop", "order", "purchase", "learn", "more", "get", "started",
+    "try", "now", "see", "find", "out", "discover", "link", "bio", "tap",
+    "click", "below", "swipe", "download", "sign", "up", "visit", "available",
+    "miss", "check", "this", "your", "you", "sale", "offer", "official",
+    "store", "free", "best", "new", "today"
+}
+
+# -------------------------------
+# STREAMLIT CONFIG
+# -------------------------------
+st.set_page_config(
+    page_title="Meta Ads Library Analyzer",
+    page_icon="🎯",
+    layout="wide"
+)
+
+# -------------------------------
+# MODEL LOADERS (CACHED)
+# -------------------------------
+@st.cache_resource
+def load_clip():
+    model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32")
+    processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
+    return model, processor
+
+@st.cache_resource
+def load_whisper():
+    return whisper.load_model("base")
+
+@st.cache_resource
+def load_face_detector():
+    # Try MediaPipe first; some installs expose different APIs.
+    try:
+        if hasattr(mp, "solutions"):
+            detector = mp.solutions.face_detection.FaceDetection(
+                model_selection=0,
+                min_detection_confidence=0.5
+            )
+            return {
+                "backend": "mediapipe",
+                "detector": detector
+            }
+    except:
+        pass
+
+    # Fallback: OpenCV Haar Cascade for broader environment compatibility.
+    try:
+        cascade_path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+        cascade = cv2.CascadeClassifier(cascade_path)
+        if not cascade.empty():
+            return {
+                "backend": "opencv_haar",
+                "detector": cascade
+            }
+    except:
+        pass
+
+    return {
+        "backend": "none",
+        "detector": None
+    }
+
+
+def frame_has_face(frame, face_detector):
+    try:
+        backend = face_detector.get("backend")
+        detector = face_detector.get("detector")
+
+        if backend == "mediapipe":
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            results = detector.process(rgb)
+            return bool(results and results.detections)
+
+        if backend == "opencv_haar":
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            faces = detector.detectMultiScale(
+                gray,
+                scaleFactor=1.1,
+                minNeighbors=4,
+                minSize=(40, 40)
+            )
+            return len(faces) > 0
+
+        return False
+
+    except:
+        return False
+
+# -------------------------------
+# FRAME EXTRACTION
+# -------------------------------
+def extract_key_frames(cap, fps, frame_count):
+    frames = []
+    key_frames = [
+        0,
+        int(fps * 3),
+        int(frame_count * 0.25),
+        int(frame_count * 0.5),
+        frame_count - 1
+    ]
+
+    for idx in key_frames:
+        if idx < frame_count:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+            ret, frame = cap.read()
+            if ret:
+                frames.append(frame)
+
+    return frames
+
+
+def format_brand_name(token):
+    if not token:
+        return ""
+    if len(token) <= 4 and token.isalpha():
+        return token.upper()
+    return token.title()
+
+
+def infer_brand_from_filename(video_path):
+    try:
+        stem = Path(video_path).stem.lower()
+        tokens = [t for t in re.split(r"[^a-z0-9]+", stem) if t]
+
+        candidates = []
+        for token in tokens:
+            if token.isdigit():
+                continue
+            if len(token) < 3:
+                continue
+            if token in GENERIC_FILENAME_TOKENS:
+                continue
+            candidates.append(token)
+
+        if not candidates:
+            return None
+
+        # Longer tokens are usually more informative than short generic chunks.
+        best = max(candidates, key=len)
+        return format_brand_name(best)
+    except:
+        return None
+
+
+def infer_brand_from_logo_text(frames):
+    try:
+        if not frames:
+            return None
+
+        token_scores = {}
+        frame_indices = sorted(set([0, len(frames) // 2, len(frames) - 1]))
+
+        for idx in frame_indices:
+            frame = frames[idx]
+            h, w = frame.shape[:2]
+            crop_h = max(1, int(h * 0.30))
+            crop_w = max(1, int(w * 0.30))
+
+            regions = [
+                (frame[:crop_h, :crop_w], 1.25),                 # top-left
+                (frame[:crop_h, w - crop_w:], 1.25),             # top-right
+                (frame[h - crop_h:, :crop_w], 1.0),              # bottom-left
+                (frame[h - crop_h:, w - crop_w:], 1.0),          # bottom-right
+            ]
+
+            for crop, weight in regions:
+                result = reader.readtext(crop)
+                for _, text, conf in result:
+                    if conf < 0.55:
+                        continue
+
+                    parts = [p for p in re.split(r"[^A-Za-z0-9]+", text) if p]
+                    for part in parts:
+                        token = part.lower().strip()
+                        if len(token) < 3 or len(token) > 18:
+                            continue
+                        if token.isdigit():
+                            continue
+                        if token in GENERIC_TEXT_TOKENS:
+                            continue
+
+                        token_scores[token] = token_scores.get(token, 0.0) + (conf * weight)
+
+        if not token_scores:
+            return None
+
+        best_token, best_score = max(token_scores.items(), key=lambda x: x[1])
+        if best_score < 0.9:
+            return None
+
+        return format_brand_name(best_token)
+    except:
+        return None
+
+
+def infer_brand_name(video_path, frames):
+    from_filename = infer_brand_from_filename(video_path)
+    if from_filename:
+        return from_filename
+
+    from_logo = infer_brand_from_logo_text(frames)
+    if from_logo:
+        return from_logo
+
+    return Path(video_path).stem
+
+# -------------------------------
+# DETECTORS (BOOLEAN ONLY)
+# -------------------------------
+def detect_hook(video_path):
+    try:
+        model = load_whisper()
+        # Speed optimization: decode only the early audio window needed for hook checks.
+        transcribe_input = video_path
+        try:
+            audio = whisper.audio.load_audio(video_path)
+            sample_rate = whisper.audio.SAMPLE_RATE
+            transcribe_input = audio[: int(HOOK_AUDIO_SECONDS * sample_rate)]
+        except:
+            transcribe_input = video_path
+
+        result = model.transcribe(
+            transcribe_input,
+            fp16=False,
+            temperature=0.0,
+            condition_on_previous_text=False,
+            beam_size=1,
+            best_of=1
+        )
+
+        segments = result.get("segments", [])
+
+        # Collect speech in first 3.5 seconds
+        early_segments = [
+            seg for seg in segments
+            if seg.get("start", 999) <= 3.5
+        ]
+
+        # 1️⃣ If someone starts speaking almost immediately → hook
+        if any(seg.get("start", 999) <= 0.4 for seg in early_segments):
+            return True
+
+        early_text = " ".join(
+            seg.get("text", "").lower() for seg in early_segments
+        ).strip()
+        if not early_text:
+            early_text = result.get("text", "").lower()
+
+        # 2️⃣ Hook archetypes (grouped by intent)
+        curiosity = [
+            "did you know", "nobody tells", "this changed",
+            "i didn't know", "what if", "guess what"
+        ]
+
+        direct_address = [
+            "you", "your", "if you", "listen", "watch this"
+        ]
+
+        problem_statements = [
+            "struggling", "tired of", "sick of",
+            "problem", "issue", "hard to"
+        ]
+
+        story_openers = [
+            "i was", "this happened", "so i",
+            "okay so", "here's what"
+        ]
+
+        hook_signals = (
+            curiosity
+            + direct_address
+            + problem_statements
+            + story_openers
+        )
+
+        # 3️⃣ Intent-based detection (not exact matching)
+        matches = sum(1 for phrase in hook_signals if phrase in early_text)
+
+        return matches >= 1
+
+    except:
+        return False
+
+
+
+def detect_product(frames):
+    try:
+        model, processor = load_clip()
+        if not frames:
+            return False
+
+        labels = [
+            "a product",
+            "someone holding a product",
+            "a packaged item",
+            "a bottle or box",
+            "a branded item"
+        ]
+
+        images = [Image.fromarray(frame) for frame in frames]
+        inputs = processor(
+            text=labels,
+            images=images,
+            return_tensors="pt",
+            padding=True
+        )
+
+        with torch.no_grad():
+            outputs = model(**inputs)
+
+        probs = outputs.logits_per_image.softmax(dim=1)
+        hits = int((probs.max(dim=1).values > 0.32).sum().item())
+
+        # Humans accept repeated partial exposure
+        return hits >= 2
+
+    except:
+        return False
+
+
+
+def detect_price_and_cta(frames):
+    try:
+        price_hits = 0
+        cta_hits = 0
+
+        cta_phrases = [
+            # Hard CTAs
+            "buy", "shop", "order", "purchase",
+            # Soft CTAs
+            "learn more", "get started", "try now",
+            "see more", "find out", "discover",
+            # Platform-native
+            "link in bio", "tap the link", "click below",
+            "swipe", "download", "sign up", "visit",
+            # Implied CTAs
+            "available now", "don’t miss", "now available",
+            "check this out", "get yours"
+        ]
+
+        for frame in frames:
+            result = reader.readtext(frame)
+            for _, text, conf in result:
+                if conf < 0.5:
+                    continue
+
+                t = text.lower()
+
+                # PRICE (unchanged)
+                if (
+                    any(sym in t for sym in ["₹", "rs", "$", "inr"])
+                    and any(c.isdigit() for c in t)
+                ):
+                    price_hits += 1
+
+                # CTA (intent-based)
+                if any(phrase in t for phrase in cta_phrases):
+                    cta_hits += 1
+
+                # No need to OCR remaining frames once both are confirmed.
+                if price_hits >= 1 and cta_hits >= 1:
+                    break
+
+            if price_hits >= 1 and cta_hits >= 1:
+                break
+
+        return {
+            "price": price_hits >= 1,
+            "cta": cta_hits >= 1
+        }
+
+    except:
+        return {
+            "price": False,
+            "cta": False
+        }
+
+
+
+def detect_testimonial(frames):
+    try:
+        face_detector = load_face_detector()
+        frames_with_faces = 0
+
+        for frame in frames:
+            if frame_has_face(frame, face_detector):
+                frames_with_faces += 1
+
+        # lower threshold = human-like judgment
+        return frames_with_faces >= 1
+
+    except:
+        return False
+
+
+
+def detect_female_model(frames):
+    try:
+        model, processor = load_clip()
+        face_detector = load_face_detector()
+        hits = 0
+
+        labels = [
+            "a woman",
+            "a female model",
+            "a female person in an advertisement",
+            "a man",
+            "a male model",
+            "no person in the frame"
+        ]
+
+        candidate_rgbs = []
+        for frame in frames:
+            face_present = frame_has_face(frame, face_detector)
+            if not face_present:
+                continue
+
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            candidate_rgbs.append(rgb)
+
+        if not candidate_rgbs:
+            return False
+
+        images = [Image.fromarray(rgb) for rgb in candidate_rgbs]
+        inputs = processor(
+            text=labels,
+            images=images,
+            return_tensors="pt",
+            padding=True
+        )
+
+        with torch.no_grad():
+            outputs = model(**inputs)
+
+        probs = outputs.logits_per_image.softmax(dim=1)
+        for row in probs:
+            female_score = row[:3].max().item()
+            contrast_score = row[3:].max().item()
+
+            if female_score >= 0.32 and female_score >= (contrast_score + 0.03):
+                hits += 1
+
+        return hits >= 2
+
+    except:
+        return False
+
+
+
+def detect_mobile(width, height):
+    try:
+        ar = width / height
+        return 0.56 <= ar <= 0.57
+    except:
+        return False
+
+# -------------------------------
+# MAIN ANALYSIS (DECISION ONLY)
+# -------------------------------
+def analyze_video_with_ai(video_path, selected_params, include_brand=False):
+    cap = cv2.VideoCapture(video_path)
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+    frames = extract_key_frames(cap, fps, frame_count)
+    cap.release()
+
+    DECISIONS = {}
+
+    if selected_params.get("hook_3sec"):
+        DECISIONS["hook_3sec"] = detect_hook(video_path)
+
+    if selected_params.get("product_visible"):
+        DECISIONS["product_visible"] = detect_product(frames)
+
+    if selected_params.get("price_shown") or selected_params.get("cta_present"):
+        ocr = detect_price_and_cta(frames)
+
+        if selected_params.get("price_shown"):
+            DECISIONS["price_shown"] = ocr["price"]
+
+        if selected_params.get("cta_present"):
+            DECISIONS["cta_present"] = ocr["cta"]
+
+    if selected_params.get("testimonial"):
+        DECISIONS["testimonial"] = detect_testimonial(frames)
+
+    if selected_params.get("female_model_present"):
+        DECISIONS["female_model_present"] = detect_female_model(frames)
+
+    if selected_params.get("mobile_optimized"):
+        DECISIONS["mobile_optimized"] = detect_mobile(width, height)
+
+    if include_brand:
+        brand_name = infer_brand_name(video_path, frames)
+        return DECISIONS, brand_name
+
+    return DECISIONS
+
+def process_videos_in_batch(video_paths, selected_params):
+    rows = []
+
+    for idx, video_path in enumerate(video_paths, start=1):
+        try:
+            decisions, brand_name = analyze_video_with_ai(
+                video_path,
+                selected_params,
+                include_brand=True
+            )
+
+            row = {
+                "video_name": brand_name,
+                "source_file": Path(video_path).name
+            }
+
+            for k, v in decisions.items():
+                row[k] = "present" if v else "absent"
+
+        except:
+            # Absolute safety: if anything breaks, mark all absent
+            row = {
+                "video_name": Path(video_path).stem,
+                "source_file": Path(video_path).name
+            }
+            for k in selected_params.keys():
+                row[k] = "absent"
+
+        rows.append(row)
+
+    return pd.DataFrame(rows)
+
+# ===============================
+# UI (UNCHANGED BEHAVIOR)
+# ===============================
+
+st.markdown("# 🎯 META ADS LIBRARY ANALYZER")
+st.markdown("---")
+
+with st.sidebar:
+    st.markdown("## ⚙️ Analysis Parameters")
+    params = {
+        "hook_3sec": st.checkbox("Hook in first 3 seconds", True),
+        "product_visible": st.checkbox("Product clearly shown", True),
+        "price_shown": st.checkbox("Price mentioned", True),
+        "cta_present": st.checkbox("Call-to-action present", True),
+        "testimonial": st.checkbox("Customer testimonial", False),
+        "female_model_present": st.checkbox("Female model present", True),
+        "mobile_optimized": st.checkbox("Mobile optimized (9:16)", True),
+    }
+
+LABELS = {
+    "hook_3sec": "Hook in First 3 Seconds",
+    "product_visible": "Product Clearly Shown",
+    "price_shown": "Price Mentioned",
+    "cta_present": "Call-to-Action Present",
+    "testimonial": "Customer Testimonial",
+    "female_model_present": "Female Model Present",
+    "mobile_optimized": "Mobile Optimized (9:16)"
+}
+
+tab1, tab2, tab3 = st.tabs(
+    ["📥 Analyze Single", "📦 Batch Analyze", "📊 Results"]
+)
+
+# -----------------------------
+# TAB 1 — SINGLE ANALYSIS
+# -----------------------------
+with tab1:
+    uploaded_video = st.file_uploader(
+        "Upload ad video",
+        type=["mp4", "mov"],
+        key="single_video"
+    )
+
+    if st.button("🚀 Analyze", key="single_analyze_btn"):
+        if uploaded_video:
+            path = f"/tmp/{uploaded_video.name}"
+            with open(path, "wb") as f:
+                f.write(uploaded_video.getbuffer())
+
+            with st.spinner("Analyzing..."):
+                st.session_state.analysis_results = analyze_video_with_ai(
+                    path, params
+                )
+
+# -----------------------------
+# TAB 2 — BATCH ANALYZE  ✅
+# -----------------------------
+with tab2:
+    st.markdown("### 📦 Batch Video Analysis (ZIP Upload)")
+    st.markdown("Upload a ZIP file containing video ads (.mp4, .mov)")
+
+    uploaded_zip = st.file_uploader(
+        "Upload ZIP of videos",
+        type=["zip"],
+        key="batch_zip"
+    )
+
+    if st.button("🚀 Run Batch Analysis", key="batch_analyze_btn"):
+        if uploaded_zip:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                zip_path = Path(tmpdir) / uploaded_zip.name
+
+                with open(zip_path, "wb") as f:
+                    f.write(uploaded_zip.getbuffer())
+
+                with zipfile.ZipFile(zip_path, "r") as zip_ref:
+                    zip_ref.extractall(tmpdir)
+
+                video_files = [
+                    str(p) for p in Path(tmpdir).rglob("*")
+                    if p.suffix.lower() in [".mp4", ".mov"]
+                ]
+
+                st.info(f"Found {len(video_files)} videos. Processing...")
+
+                with st.spinner("Analyzing videos one by one..."):
+                    df = process_videos_in_batch(video_files, params)
+
+                excel_path = Path(tmpdir) / "ad_analysis_results.xlsx"
+                df.to_excel(excel_path, index=False)
+
+                with open(excel_path, "rb") as f:
+                    st.download_button(
+                        label="⬇️ Download Excel Results",
+                        data=f,
+                        file_name="ad_analysis_results.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                    )
+
+# -----------------------------
+# TAB 3 — RESULTS  ✅
+# -----------------------------
+with tab3:
+    if st.session_state.get("analysis_results"):
+        for key, value in st.session_state.analysis_results.items():
+            icon = "✅" if value else "❌"
+            status = "Present" if value else "Absent"
+            st.write(f"{LABELS[key]} → {icon} {status}")
+    else:
+        st.info("Run an analysis to see results.")
